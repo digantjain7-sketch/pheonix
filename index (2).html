@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phoenix AI — Road Damage Detection & Severity Mapping</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔥</text></svg>">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>tailwind.config={theme:{extend:{colors:{navy:{950:'#060e1b',900:'#0a1628',800:'#0e1f38',700:'#152a4a',600:'#1f3a63'}}}}}</script>
+<style>
+body{background:#0a1628;color:#e2e8f0;font-family:Inter,system-ui,sans-serif}
+@keyframes up{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}.fade{animation:up .35s ease both}
+.leaflet-container{background:#0e1f38;border-radius:12px}select,input{color-scheme:dark}
+::-webkit-scrollbar{height:8px;width:8px}::-webkit-scrollbar-thumb{background:#1f3a63;border-radius:8px}
+</style>
+</head>
+<body>
+<div id="root"><p style="padding:2rem">Loading Phoenix AI…</p></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script src="https://unpkg.com/react-is@18.2.0/umd/react-is.production.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exifr@7.1.3/dist/full.umd.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<script type="text/plain" id="app">
+const {useState,useEffect,useRef,useMemo}=React;
+const {ResponsiveContainer,BarChart,Bar,XAxis,YAxis,Tooltip,PieChart,Pie,Cell,LineChart,Line,CartesianGrid,Legend}=Recharts;
+
+type Sev='Low'|'Medium'|'High';
+interface Defect{id:string;cls:string;conf:number;sev:Sev;road:string;imp:number;lat:number|null;lng:number|null;date:string;status:string;reports:number;src:string}
+interface Cfg{mode:'demo'|'fastapi'|'roboflow';url:string;key:string;model:string;minConf:number;medT:number;highT:number}
+interface Order{id:string;defectId:string;assignee:string;due:string;status:string;note:string}
+
+const CLASSES=['Pothole','Longitudinal Crack','Transverse Crack','Alligator Cracking','Rutting','Damaged Surface'];
+const SEV:Sev[]=['Low','Medium','High'];
+const SC:Record<string,string>={Low:'#22c55e',Medium:'#f59e0b',High:'#ef4444'};
+const ACT:Record<string,string[]>={
+ 'Pothole':['Monitor; cold-patch if it grows','Schedule patching within 14 days','Urgent patching within 48h; cone off area'],
+ 'Longitudinal Crack':['Monitor; routine crack sealing','Seal cracks within 30 days','Seal and inspect base layer'],
+ 'Transverse Crack':['Monitor; routine crack sealing','Seal cracks within 30 days','Seal and inspect for joint failure'],
+ 'Alligator Cracking':['Monitor; fog seal','Plan patch/overlay this quarter','Section removal and base repair'],
+ 'Rutting':['Monitor for growth','Plan milling/overlay','Milling and resurfacing; check drainage'],
+ 'Damaged Surface':['Monitor','Schedule surface repair','Priority resurfacing of the affected area']};
+const STATUS=['Open','Assigned','In Progress','Completed'];
+const ROADS:[string,number,number,number][]=[['JLN Marg',3,26.8512,75.8120],['Tonk Road',3,26.8650,75.7990],['Ajmer Road',3,26.9100,75.7400],['MI Road',2,26.9180,75.8000],['Sikar Road',2,26.9500,75.7900],['Vaishali Nagar Main',2,26.9050,75.7300],['Malviya Nagar Lane 4',1,26.8560,75.8100],['Mansarovar Colony Rd',1,26.8480,75.7640]];
+const cap=(s:string)=>s;
+const sevOf=(cls:string,area:number,c:{medT:number;highT:number})=>{const k=(cls==='Pothole'||cls==='Alligator Cracking')?1.5:1;const a=area*k;return (a>=c.highT?'High':a>=c.medT?'Medium':'Low') as Sev};
+const DEF:Cfg={mode:'demo',url:'http://localhost:8000',key:'',model:'road-damage/1',minConf:0.4,medT:0.5,highT:2};
+
+function seed():Defect[]{let s=7;const r=()=>(s=(s*16807)%2147483647)/2147483647;const out:Defect[]=[];
+ for(let i=0;i<32;i++){const rd=ROADS[Math.floor(r()*ROADS.length)];const cls=CLASSES[Math.floor(r()*CLASSES.length)];const sev=SEV[r()<.4?0:r()<.65?1:2];
+  const d=new Date(2026,9,14-Math.floor(r()*55));out.push({id:'S-'+(1001+i),cls,conf:Math.round(55+r()*40),sev,road:rd[0],imp:rd[1],lat:rd[2]+(r()-.5)*.012,lng:rd[3]+(r()-.5)*.012,date:d.toISOString().slice(0,10),status:r()<.7?'Open':'Assigned',reports:1+Math.floor(r()*5),src:'sample'})}
+ return out}
+
+function useLS<T>(k:string,init:T):[T,(v:T)=>void]{const[v,s]=useState<T>(()=>{try{const x=localStorage.getItem(k);return x?JSON.parse(x):init}catch(e){return init}});
+ return[v,(n:T)=>{s(n);try{localStorage.setItem(k,JSON.stringify(n))}catch(e){}}]}
+
+/* ---------- API service ---------- */
+const mapClass=(l:string)=>{const t=l.toLowerCase();
+ if(/d40|pothole/.test(t))return'Pothole';if(/d00|longitud/.test(t))return'Longitudinal Crack';if(/d10|transv/.test(t))return'Transverse Crack';
+ if(/d20|alligator|fatigue/.test(t))return'Alligator Cracking';if(/rut/.test(t))return'Rutting';return'Damaged Surface'};
+const loadImg=(u:string)=>new Promise<HTMLImageElement>((ok,no)=>{const i=new Image();i.onload=()=>ok(i);i.onerror=()=>no(new Error('Could not decode image'));i.src=u});
+const b64=(f:File)=>new Promise<string>((ok,no)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]);r.onerror=()=>no(new Error('Read failed'));r.readAsDataURL(f)});
+interface Det{cls:string;raw:string;conf:number;box:number[]}
+const api={
+ async detect(file:File,c:Cfg,img:HTMLImageElement):Promise<{demo:boolean;dets:Det[]}>{
+  if(c.mode==='demo'){const n=2+Math.floor(Math.random()*3);const dets:Det[]=[];
+   for(let i=0;i<n;i++){const w=img.width*(.08+Math.random()*.2),h=img.height*(.06+Math.random()*.15);
+    dets.push({cls:CLASSES[Math.floor(Math.random()*6)],raw:'demo',conf:.5+Math.random()*.4,box:[Math.random()*(img.width-w),img.height*.3+Math.random()*(img.height*.7-h),w,h]})}
+   return{demo:true,dets}}
+  if(c.mode==='roboflow'){if(!c.key||!c.model)throw new Error('Roboflow API key and model (e.g. workspace-model/3) are required in Settings.');
+   const r=await fetch(`https://detect.roboflow.com/${c.model}?api_key=${encodeURIComponent(c.key)}&confidence=${Math.round(c.minConf*100)}`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:await b64(file)});
+   if(!r.ok)throw new Error('Roboflow error '+r.status);const j=await r.json();
+   return{demo:false,dets:(j.predictions||[]).map((p:any)=>({cls:mapClass(p.class),raw:p.class,conf:p.confidence,box:[p.x-p.width/2,p.y-p.height/2,p.width,p.height]}))}}
+  const fd=new FormData();fd.append('file',file);
+  const r=await fetch(c.url.replace(/\/$/,'')+'/detect',{method:'POST',body:fd});
+  if(!r.ok)throw new Error('Backend error '+r.status+' at '+c.url+'/detect');const j=await r.json();
+  /* Expected: {width,height,detections:[{label,confidence,bbox:[x1,y1,x2,y2]}]} (pixels of the uploaded image) */
+  return{demo:false,dets:(j.detections||[]).map((d:any)=>({cls:mapClass(d.label),raw:d.label,conf:d.confidence,box:[d.bbox[0],d.bbox[1],d.bbox[2]-d.bbox[0],d.bbox[3]-d.bbox[1]]}))}},
+ async health(c:Cfg){const r=await fetch(c.url.replace(/\/$/,'')+'/health');if(!r.ok)throw new Error('HTTP '+r.status);return true}};
+async function readGps(f:File){try{const g=await (window as any).exifr.gps(f);if(g&&isFinite(g.latitude)&&isFinite(g.longitude))return{lat:+g.latitude,lng:+g.longitude}}catch(e){}return null}
+
+/* ---------- exports ---------- */
+const dl=(name:string,href:string)=>{const a=document.createElement('a');a.href=href;a.download=name;document.body.appendChild(a);a.click();a.remove()};
+const csvOf=(rows:any[][])=>rows.map(r=>r.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\n');
+const dlCsv=(name:string,rows:any[][])=>{const u=URL.createObjectURL(new Blob([csvOf(rows)],{type:'text/csv'}));dl(name,u);setTimeout(()=>URL.revokeObjectURL(u),2000)};
+
+/* ---------- UI atoms ---------- */
+const P:Record<string,string>={home:'M3 12l9-9 9 9M5 10v10h14V10',map:'M9 3L3 5v16l6-2 6 2 6-2V3l-6 2-6-2zM9 3v16M15 5v16',up:'M12 16V4M7 9l5-5 5 5M4 20h16',table:'M3 4h18v16H3zM3 10h18M9 4v16',alert:'M12 3l10 18H2L12 3zM12 10v5M12 18v.01',clip:'M9 4h6v3H9zM6 5H5v16h14V5h-1M9 12h6M9 16h6',chart:'M4 20V4M4 20h16M8 16v-5M12 16V8M16 16v-3',gear:'M12 8a4 4 0 100 8 4 4 0 000-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2',dl:'M12 4v12M7 11l5 5 5-5M4 20h16',menu:'M4 6h16M4 12h16M4 18h16',x:'M6 6l12 12M18 6L6 18',ref:'M4 4v6h6M20 20v-6h-6M5 14a8 8 0 0013 3M19 10A8 8 0 006 7'};
+const Ic=({n,c='w-5 h-5'}:{n:string;c?:string})=><svg className={c} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={P[n]}/></svg>;
+const Card=({t,children,r}:{t?:string;children:any;r?:any})=><div className="fade bg-navy-800 border border-navy-600/60 rounded-2xl p-4 md:p-5 shadow-lg shadow-black/20">{(t||r)&&<div className="flex items-center justify-between mb-3"><h3 className="font-semibold text-slate-100">{t}</h3>{r}</div>}{children}</div>;
+const Btn=({onClick,children,v='p',dis,cls=''}:{onClick?:()=>void;children:any;v?:string;dis?:boolean;cls?:string})=><button disabled={dis} onClick={onClick} className={`inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition disabled:opacity-40 disabled:cursor-not-allowed ${v==='p'?'bg-cyan-500 text-navy-950 hover:bg-cyan-400':'bg-navy-700 text-slate-200 hover:bg-navy-600 border border-navy-600'} ${cls}`}>{children}</button>;
+const Badge=({s}:{s:string})=><span className="px-2 py-0.5 rounded-full text-xs font-semibold" style={{background:(SC[s]||'#38bdf8')+'26',color:SC[s]||'#38bdf8'}}>{s}</span>;
+const Sel=({v,set,opts,all}:{v:string;set:(x:string)=>void;opts:string[];all?:string})=><select value={v} onChange={e=>set(e.target.value)} className="bg-navy-700 border border-navy-600 rounded-lg px-3 py-2 text-sm">{all&&<option value="All">{all}</option>}{opts.map(o=><option key={o}>{o}</option>)}</select>;
+const Kpi=({l,v,s,c}:{l:string;v:any;s?:string;c?:string})=><Card><p className="text-xs uppercase tracking-wider text-slate-400">{l}</p><p className="text-3xl font-bold mt-1" style={{color:c||'#22d3ee'}}>{v}</p>{s&&<p className="text-xs text-slate-500 mt-1">{s}</p>}</Card>;
+const Th=({c}:{c:string[]})=><thead><tr className="text-left text-xs uppercase text-slate-400 border-b border-navy-600">{c.map(x=><th key={x} className="py-2 pr-4 font-medium whitespace-nowrap">{x}</th>)}</tr></thead>;
+const tip={contentStyle:{background:'#0e1f38',border:'1px solid #1f3a63',borderRadius:8,color:'#e2e8f0'}};
+const cnt=(a:Defect[],k:keyof Defect,keys:string[])=>keys.map(n=>({name:n,value:a.filter(d=>d[k]===n).length}));
+
+/* ---------- Pages ---------- */
+function Overview({d,orders}:{d:Defect[];orders:Order[]}){
+ const avg=d.length?Math.round(d.reduce((a,x)=>a+x.conf,0)/d.length):0;const high=d.filter(x=>x.sev==='High').length;
+ return<div className="space-y-4">
+  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4"><Kpi l="Total defects" v={d.length}/><Kpi l="High severity" v={high} c="#ef4444" s={`${d.length?Math.round(high/d.length*100):0}% of all`}/><Kpi l="Open work orders" v={orders.filter(o=>o.status!=='Completed').length} c="#f59e0b"/><Kpi l="Avg. model confidence" v={avg+'%'} s="Separate from severity"/></div>
+  <div className="grid lg:grid-cols-3 gap-4">
+   <div className="lg:col-span-2"><Card t="Defects by type"><div className="h-64"><ResponsiveContainer><BarChart data={cnt(d,'cls',CLASSES)}><CartesianGrid stroke="#1f3a63" vertical={false}/><XAxis dataKey="name" tick={{fill:'#94a3b8',fontSize:10}} interval={0} tickFormatter={(x:string)=>x.split(' ')[0]}/><YAxis tick={{fill:'#94a3b8',fontSize:11}} allowDecimals={false}/><Tooltip {...tip}/><Bar dataKey="value" fill="#22d3ee" radius={[6,6,0,0]}/></BarChart></ResponsiveContainer></div></Card></div>
+   <Card t="Severity distribution"><div className="h-64"><ResponsiveContainer><PieChart><Pie data={cnt(d,'sev',SEV)} dataKey="value" innerRadius={50} outerRadius={80} paddingAngle={3}>{SEV.map(s=><Cell key={s} fill={SC[s]}/>)}</Pie><Tooltip {...tip}/><Legend/></PieChart></ResponsiveContainer></div></Card></div>
+  <Card t="Recent detections"><div className="overflow-x-auto"><table className="w-full text-sm"><Th c={['ID','Type','Confidence','Severity','Road','Date']}/><tbody>{[...d].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,7).map(x=><tr key={x.id} className="border-b border-navy-700"><td className="py-2 pr-4">{x.id}</td><td className="pr-4">{x.cls}</td><td className="pr-4">{x.conf}%</td><td className="pr-4"><Badge s={x.sev}/></td><td className="pr-4">{x.road}</td><td>{x.date}</td></tr>)}</tbody></table></div>
+  <p className="text-xs text-slate-500 mt-3">Dashboard data marked “S-” is consistent <b>sample data</b> for demonstration. Real analyses from the Upload page are added with “U-” IDs.</p></Card></div>}
+
+function MapPage({d}:{d:Defect[]}){
+ const ref=useRef<HTMLDivElement>(null),m=useRef<any>(null),g=useRef<any>(null);const[sv,setSv]=useState('All'),[t,setT]=useState('All');
+ const pts=useMemo(()=>d.filter(x=>x.lat!=null&&(sv==='All'||x.sev===sv)&&(t==='All'||x.cls===t)),[d,sv,t]);
+ useEffect(()=>{m.current=L.map(ref.current!).setView([26.89,75.79],12);L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{subdomains:'abcd',maxZoom:19,attribution:'© OpenStreetMap contributors © CARTO'}).addTo(m.current);g.current=L.layerGroup().addTo(m.current);setTimeout(()=>m.current.invalidateSize(),100);return()=>{m.current.remove()}},[]);
+ useEffect(()=>{g.current.clearLayers();pts.forEach(x=>L.circleMarker([x.lat,x.lng],{radius:x.sev==='High'?10:8,color:'#fff',weight:1,fillColor:SC[x.sev],fillOpacity:.85}).bindPopup(`<b>${x.cls}</b><br>Severity: ${x.sev}<br>Confidence: ${x.conf}%<br>${x.road}<br>${x.date}`).addTo(g.current))},[pts]);
+ return<div className="space-y-3"><div className="flex flex-wrap gap-3 items-center"><Sel v={sv} set={setSv} opts={SEV} all="All severities"/><Sel v={t} set={setT} opts={CLASSES} all="All types"/><span className="text-sm text-slate-400">{pts.length} mapped defects</span>
+  {SEV.map(s=><span key={s} className="text-xs flex items-center gap-1"><i className="w-3 h-3 rounded-full inline-block" style={{background:SC[s]}}/>{s}</span>)}</div>
+  <div ref={ref} className="h-[65vh] border border-navy-600 rounded-xl"/><p className="text-xs text-slate-500">Only defects with real or sample coordinates are plotted. Uploaded photos without EXIF GPS never appear on the map.</p></div>}
+
+function Upload({cfg,onSave}:{cfg:Cfg;onSave:(r:any)=>void}){
+ const[file,setFile]=useState<File|null>(null),[url,setUrl]=useState(''),[err,setErr]=useState(''),[busy,setBusy]=useState(false),[res,setRes]=useState<any>(null),[drag,setDrag]=useState(false);
+ const pick=(f?:File)=>{if(!f)return;setRes(null);if(!/^image\/(jpeg|png|webp)$/.test(f.type)){setErr('Unsupported file. Use JPG, JPEG, PNG or WEBP.');return}
+  if(f.size>15*1024*1024){setErr('File too large (max 15 MB).');return}setErr('');setFile(f);setUrl(URL.createObjectURL(f))};
+ const run=async()=>{if(!file)return;setBusy(true);setErr('');setRes(null);
+  try{const img=await loadImg(url);const out=await api.detect(file,cfg,img);const gps=await readGps(file);
+   const rid='PHX-'+Date.now().toString(36).toUpperCase();
+   const dets=out.dets.filter(x=>x.conf>=cfg.minConf).map((x,i)=>{const area=x.box[2]*x.box[3]/(img.width*img.height)*100;const sev=sevOf(x.cls,area,cfg);return{...x,n:i+1,area,sev,action:ACT[x.cls][SEV.indexOf(sev)]}});
+   const cv=document.createElement('canvas');cv.width=img.width;cv.height=img.height;const cx=cv.getContext('2d')!;cx.drawImage(img,0,0);
+   const lw=Math.max(2,img.width/300);dets.forEach(x=>{cx.strokeStyle=SC[x.sev];cx.lineWidth=lw;cx.strokeRect(x.box[0],x.box[1],x.box[2],x.box[3]);
+    const lb=`#${x.n} ${x.cls} ${Math.round(x.conf*100)}%`;cx.font=`bold ${Math.max(12,img.width/55)}px sans-serif`;const w=cx.measureText(lb).width+8,h=Math.max(16,img.width/45);
+    cx.fillStyle=SC[x.sev];cx.fillRect(x.box[0],Math.max(0,x.box[1]-h),w,h);cx.fillStyle='#000';cx.fillText(lb,x.box[0]+4,Math.max(h-4,x.box[1]-4))});
+   const r={rid,date:new Date().toISOString(),name:file.name,demo:out.demo,dets,gps,ann:cv.toDataURL('image/jpeg',.9),w:img.width,h:img.height};
+   setRes(r);if(!out.demo&&dets.length)onSave(r)}catch(e:any){setErr((e.message||'Analysis failed')+(cfg.mode==='fastapi'?' — is the backend running and CORS enabled?':''))}finally{setBusy(false)}};
+ const dist=res?SEV.map(s=>({s,n:res.dets.filter((x:any)=>x.sev===s).length})):[];
+ const csv=()=>dlCsv(res.rid+'.csv',[['report_id','date','demo','defect_no','type','confidence_pct','severity','bbox_area_pct','latitude','longitude','action'],...res.dets.map((x:any)=>[res.rid,res.date,res.demo,x.n,x.cls,Math.round(x.conf*100),x.sev,x.area.toFixed(2),res.gps?.lat??'',res.gps?.lng??'',x.action])]);
+ const pdf=()=>{const J=(window as any).jspdf;if(!J){setErr('PDF library failed to load (check network).');return}const D=new J.jsPDF();let y=16;
+  const ln=(s:string,sz=10,b=false)=>{D.setFontSize(sz);D.setFont('helvetica',b?'bold':'normal');D.splitTextToSize(s,180).forEach((l:string)=>{if(y>280){D.addPage();y=16}D.text(l,15,y);y+=sz*.5+2})};
+  ln('Phoenix AI - Road Inspection Report',16,true);y+=2;ln(`Report ID: ${res.rid}`);ln(`Date: ${new Date(res.date).toLocaleString()}`);ln(`Image: ${res.name}`);
+  if(res.demo)ln('*** DEMO PREDICTIONS - randomly generated, NOT real AI output. Configure a model in Settings. ***',10,true);
+  ln(`Location: ${res.gps?`${res.gps.lat.toFixed(6)}, ${res.gps.lng.toFixed(6)} (EXIF GPS)`:'Not available (no GPS in image EXIF)'}`);
+  ln(`Total defects: ${res.dets.length}   |   Low: ${dist[0].n}  Medium: ${dist[1].n}  High: ${dist[2].n}`);y+=2;
+  const ih=Math.min(90,180*res.h/res.w);D.addImage(res.ann,'JPEG',15,y,ih*res.w/res.h>180?180:ih*res.w/res.h,ih>90?90:ih);y+=ih+6;
+  res.dets.forEach((x:any)=>{ln(`#${x.n} ${x.cls} - confidence ${Math.round(x.conf*100)}% - severity ${x.sev}`,10,true);ln(`Recommended action: ${x.action}`)});y+=3;
+  ln('Notes: Confidence is model certainty and is independent of severity. Severity is estimated from defect type and the share of image area covered; it is not a measured depth or size. Field verification required.',8);D.save(res.rid+'.pdf')};
+ return<div className="space-y-4">
+  {cfg.mode==='demo'&&<div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200"><b>Demo mode:</b> no AI model is configured, so results will be <b>randomly generated demo predictions</b>. Go to Settings and set a FastAPI YOLO endpoint (POST /detect) or a Roboflow model + API key for real detection.</div>}
+  <Card t="Upload road image"><label onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);pick(e.dataTransfer.files[0])}} className={`block cursor-pointer text-center border-2 border-dashed rounded-xl p-8 transition ${drag?'border-cyan-400 bg-cyan-500/10':'border-navy-600 hover:border-cyan-500/60'}`}>
+   <input type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" className="hidden" onChange={e=>pick(e.target.files?.[0])}/>
+   {url?<img src={url} alt="preview" className="max-h-64 mx-auto rounded-lg"/>:<div className="text-slate-400"><div className="flex justify-center text-cyan-400 mb-2"><Ic n="up" c="w-10 h-10"/></div>Drag & drop a road image, or click to browse<br/><span className="text-xs">JPG, JPEG, PNG, WEBP · max 15 MB</span></div>}</label>
+   {file&&<p className="text-xs text-slate-400 mt-2">{file.name} · {(file.size/1024).toFixed(0)} KB</p>}
+   <div className="mt-3 flex gap-2 flex-wrap"><Btn onClick={run} dis={!file||busy}>{busy?<><span className="w-4 h-4 border-2 border-navy-950 border-t-transparent rounded-full animate-spin"/>Analyzing…</>:'Analyze Road Image'}</Btn>{file&&!busy&&<Btn v="s" onClick={()=>{setFile(null);setUrl('');setRes(null);setErr('')}}>Clear</Btn>}</div>
+   {err&&<div className="mt-3 rounded-lg bg-red-500/10 border border-red-500/40 p-3 text-sm text-red-300 flex items-center justify-between gap-3"><span>{err}</span>{file&&<Btn v="s" onClick={run}><Ic n="ref" c="w-4 h-4"/>Retry</Btn>}</div>}</Card>
+  {res&&<>
+   {res.demo&&<div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">⚠ DEMO PREDICTIONS — not produced by a real model. Not saved to the dashboard.</div>}
+   <div className="grid md:grid-cols-2 gap-4"><Card t="Original"><img src={url} alt="original" className="w-full rounded-lg"/></Card><Card t="Annotated"><img src={res.ann} alt="annotated" className="w-full rounded-lg"/></Card></div>
+   <Card t={`Inspection report ${res.rid}`} r={<div className="flex gap-2 flex-wrap"><Btn onClick={pdf}><Ic n="dl" c="w-4 h-4"/>PDF</Btn><Btn v="s" onClick={csv}><Ic n="dl" c="w-4 h-4"/>CSV</Btn><Btn v="s" onClick={()=>dl(res.rid+'-annotated.jpg',res.ann)}><Ic n="dl" c="w-4 h-4"/>Image</Btn></div>}>
+    <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm mb-4"><div><p className="text-slate-400 text-xs">Date</p>{new Date(res.date).toLocaleString()}</div><div><p className="text-slate-400 text-xs">Total defects</p>{res.dets.length}</div>
+     <div><p className="text-slate-400 text-xs">Severity</p>{dist.map(x=><span key={x.s} className="mr-2"><Badge s={x.s}/> {x.n}</span>)}</div>
+     <div><p className="text-slate-400 text-xs">Location</p>{res.gps?`${res.gps.lat.toFixed(5)}, ${res.gps.lng.toFixed(5)} (EXIF)`:'Not available — no GPS in EXIF'}</div></div>
+    {res.dets.length?<div className="overflow-x-auto"><table className="w-full text-sm"><Th c={['#','Type','Confidence','Severity','Recommended action']}/><tbody>{res.dets.map((x:any)=><tr key={x.n} className="border-b border-navy-700"><td className="py-2 pr-4">{x.n}</td><td className="pr-4">{x.cls}</td><td className="pr-4">{Math.round(x.conf*100)}%</td><td className="pr-4"><Badge s={x.sev}/></td><td>{x.action}</td></tr>)}</tbody></table></div>:<p className="text-slate-400 text-sm">No defects above the {Math.round(cfg.minConf*100)}% confidence threshold.</p>}
+    <p className="text-xs text-slate-500 mt-3">Confidence = model certainty. Severity = defect type + share of image area covered (thresholds in Settings). Depth is not measured: a single uncalibrated photo cannot give accurate depth.</p></Card></>}</div>}
+
+function Explorer({d}:{d:Defect[]}){
+ const[q,setQ]=useState(''),[sv,setSv]=useState('All'),[t,setT]=useState('All'),[st,setSt]=useState('All');
+ const rows=d.filter(x=>(sv==='All'||x.sev===sv)&&(t==='All'||x.cls===t)&&(st==='All'||x.status===st)&&(x.id+x.cls+x.road).toLowerCase().includes(q.toLowerCase()));
+ return<Card t={`Defect Explorer (${rows.length})`} r={<Btn v="s" onClick={()=>dlCsv('defects.csv',[['id','type','confidence','severity','road','lat','lng','date','status','reports'],...rows.map(x=>[x.id,x.cls,x.conf,x.sev,x.road,x.lat??'',x.lng??'',x.date,x.status,x.reports])])}><Ic n="dl" c="w-4 h-4"/>CSV</Btn>}>
+  <div className="flex flex-wrap gap-2 mb-3"><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search ID, type, road…" className="bg-navy-700 border border-navy-600 rounded-lg px-3 py-2 text-sm flex-1 min-w-[180px]"/><Sel v={sv} set={setSv} opts={SEV} all="All severities"/><Sel v={t} set={setT} opts={CLASSES} all="All types"/><Sel v={st} set={setSt} opts={STATUS} all="All statuses"/></div>
+  <div className="overflow-x-auto"><table className="w-full text-sm"><Th c={['ID','Type','Conf.','Severity','Road','Date','Status','Reports']}/><tbody>{rows.map(x=><tr key={x.id} className="border-b border-navy-700"><td className="py-2 pr-4">{x.id}</td><td className="pr-4">{x.cls}</td><td className="pr-4">{x.conf}%</td><td className="pr-4"><Badge s={x.sev}/></td><td className="pr-4">{x.road}</td><td className="pr-4">{x.date}</td><td className="pr-4">{x.status}</td><td>{x.reports}</td></tr>)}</tbody></table>{!rows.length&&<p className="text-slate-400 text-sm py-4">No matching defects.</p>}</div></Card>}
+
+const score=(x:Defect)=>[1,3,6][SEV.indexOf(x.sev)]*x.imp*5+x.reports*4;
+function Queue({d,orders,mk}:{d:Defect[];orders:Order[];mk:(id:string)=>void}){
+ const rows=[...d].filter(x=>x.status!=='Completed').sort((a,b)=>score(b)-score(a)).slice(0,15);
+ return<Card t="Urgent Action Queue"><p className="text-xs text-slate-400 mb-3">Priority score = severity weight (1/3/6) × road importance (1–3) × 5 + repeat reports × 4. Confidence is not part of the score.</p>
+  <div className="overflow-x-auto"><table className="w-full text-sm"><Th c={['Rank','ID','Type','Severity','Road','Importance','Reports','Score','']}/><tbody>{rows.map((x,i)=>{const has=orders.some(o=>o.defectId===x.id);return<tr key={x.id} className="border-b border-navy-700"><td className="py-2 pr-4 font-bold text-cyan-400">{i+1}</td><td className="pr-4">{x.id}</td><td className="pr-4">{x.cls}</td><td className="pr-4"><Badge s={x.sev}/></td><td className="pr-4">{x.road}</td><td className="pr-4">{['','Local','Collector','Arterial'][x.imp]}</td><td className="pr-4">{x.reports}</td><td className="pr-4 font-semibold">{score(x)}</td><td><Btn v="s" dis={has} onClick={()=>mk(x.id)}>{has?'Ordered':'Create order'}</Btn></td></tr>})}</tbody></table></div></Card>}
+
+function Orders({d,orders,setOrders,setStatus}:{d:Defect[];orders:Order[];setOrders:(o:Order[])=>void;setStatus:(id:string,s:string)=>void}){
+ const[f,setF]=useState({defectId:d[0]?.id||'',assignee:'',due:'',note:''});const[e,setE]=useState('');
+ const add=()=>{if(!f.defectId||!f.assignee.trim()||!f.due){setE('Defect, assignee and due date are required.');return}setE('');setOrders([{id:'WO-'+(Date.now()%100000),...f,status:'Assigned'},...orders]);setStatus(f.defectId,'Assigned');setF({...f,assignee:'',note:''})};
+ const inp="bg-navy-700 border border-navy-600 rounded-lg px-3 py-2 text-sm";
+ return<div className="space-y-4"><Card t="New work order"><div className="flex flex-wrap gap-2"><select className={inp} value={f.defectId} onChange={x=>setF({...f,defectId:x.target.value})}>{d.map(x=><option key={x.id} value={x.id}>{x.id} · {x.cls} · {x.road}</option>)}</select>
+  <input className={inp} placeholder="Assignee / crew" value={f.assignee} onChange={x=>setF({...f,assignee:x.target.value})}/><input type="date" className={inp} value={f.due} onChange={x=>setF({...f,due:x.target.value})}/><input className={inp+' flex-1 min-w-[160px]'} placeholder="Note (optional)" value={f.note} onChange={x=>setF({...f,note:x.target.value})}/><Btn onClick={add}>Create</Btn></div>{e&&<p className="text-red-400 text-sm mt-2">{e}</p>}</Card>
+  <Card t={`Work orders (${orders.length})`}>{!orders.length?<p className="text-slate-400 text-sm">No work orders yet. Create one above or from the Urgent Action Queue.</p>:<div className="overflow-x-auto"><table className="w-full text-sm"><Th c={['Order','Defect','Assignee','Due','Status','Note','']}/><tbody>{orders.map(o=><tr key={o.id} className="border-b border-navy-700"><td className="py-2 pr-4">{o.id}</td><td className="pr-4">{o.defectId}</td><td className="pr-4">{o.assignee}</td><td className="pr-4">{o.due}</td>
+   <td className="pr-4"><select className={inp} value={o.status} onChange={x=>{setOrders(orders.map(y=>y.id===o.id?{...y,status:x.target.value}:y));setStatus(o.defectId,x.target.value==='Open'?'Open':x.target.value)}}>{STATUS.map(s=><option key={s}>{s}</option>)}</select></td><td className="pr-4 text-slate-400">{o.note}</td><td><Btn v="s" onClick={()=>{setOrders(orders.filter(y=>y.id!==o.id));setStatus(o.defectId,'Open')}}>Delete</Btn></td></tr>)}</tbody></table></div>}</Card></div>}
+
+function Analytics({d}:{d:Defect[]}){
+ const trend=useMemo(()=>{const w:Record<string,number>={};d.forEach(x=>{const t=new Date(x.date);t.setDate(t.getDate()-t.getDay());const k=t.toISOString().slice(5,10);w[k]=(w[k]||0)+1});return Object.entries(w).sort().map(([name,value])=>({name,value}))},[d]);
+ const sevType=CLASSES.map(c=>({name:c.split(' ')[0],Low:d.filter(x=>x.cls===c&&x.sev==='Low').length,Medium:d.filter(x=>x.cls===c&&x.sev==='Medium').length,High:d.filter(x=>x.cls===c&&x.sev==='High').length}));
+ const ax={tick:{fill:'#94a3b8',fontSize:11}};
+ return<div className="grid lg:grid-cols-2 gap-4"><Card t="Severity by defect type"><div className="h-72"><ResponsiveContainer><BarChart data={sevType}><CartesianGrid stroke="#1f3a63" vertical={false}/><XAxis dataKey="name" {...ax}/><YAxis {...ax} allowDecimals={false}/><Tooltip {...tip}/><Legend/>{SEV.map(s=><Bar key={s} dataKey={s} stackId="a" fill={SC[s]}/>)}</BarChart></ResponsiveContainer></div></Card>
+  <Card t="Defect type share"><div className="h-72"><ResponsiveContainer><PieChart><Pie data={cnt(d,'cls',CLASSES)} dataKey="value" nameKey="name" outerRadius={90} label={(p:any)=>p.value}>{CLASSES.map((c,i)=><Cell key={c} fill={['#22d3ee','#38bdf8','#818cf8','#f59e0b','#ef4444','#22c55e'][i]}/>)}</Pie><Tooltip {...tip}/><Legend/></PieChart></ResponsiveContainer></div></Card>
+  <div className="lg:col-span-2"><Card t="Weekly detection trend"><div className="h-72"><ResponsiveContainer><LineChart data={trend}><CartesianGrid stroke="#1f3a63"/><XAxis dataKey="name" {...ax}/><YAxis {...ax} allowDecimals={false}/><Tooltip {...tip}/><Line dataKey="value" stroke="#22d3ee" strokeWidth={2.5} dot={{r:3}}/></LineChart></ResponsiveContainer></div></Card></div></div>}
+
+function Settings({cfg,setCfg,reset}:{cfg:Cfg;setCfg:(c:Cfg)=>void;reset:()=>void}){
+ const[st,setSt]=useState('');const inp="bg-navy-700 border border-navy-600 rounded-lg px-3 py-2 text-sm w-full";const u=(p:Partial<Cfg>)=>setCfg({...cfg,...p});
+ const L=({t,children}:{t:string;children:any})=><label className="block text-xs text-slate-400 space-y-1"><span>{t}</span>{children}</label>;
+ return<div className="grid lg:grid-cols-2 gap-4"><Card t="AI configuration"><div className="space-y-3">
+  <L t="Detection backend"><select className={inp} value={cfg.mode} onChange={e=>u({mode:e.target.value as any})}><option value="demo">Demo (no real AI — randomly generated)</option><option value="fastapi">FastAPI / YOLO backend</option><option value="roboflow">Roboflow hosted model</option></select></L>
+  {cfg.mode==='fastapi'&&<><L t="Backend URL"><input className={inp} value={cfg.url} onChange={e=>u({url:e.target.value})}/></L><Btn v="s" onClick={async()=>{setSt('Checking…');try{await api.health(cfg);setSt('✓ Backend reachable')}catch(e:any){setSt('✗ '+e.message+' (check URL, /health route and CORS)')}}}>Test connection</Btn><p className="text-xs text-slate-400">{st}</p>
+   <pre className="text-[11px] bg-navy-950 rounded-lg p-3 overflow-x-auto text-cyan-200">{`POST /detect  (multipart field "file")
+→ {"detections":[{"label":"D40","confidence":0.87,
+   "bbox":[x1,y1,x2,y2]}]}   // pixels
+GET  /health  → 200   (enable CORS)`}</pre></>}
+  {cfg.mode==='roboflow'&&<><L t="Model ID (workspace-model/version)"><input className={inp} value={cfg.model} onChange={e=>u({model:e.target.value})}/></L><L t="Roboflow API key"><input type="password" className={inp} value={cfg.key} onChange={e=>u({key:e.target.value})}/></L><p className="text-xs text-amber-300">The key is stored in this browser and sent from the client. For production, proxy through your own backend.</p></>}
+  <L t={`Minimum confidence: ${Math.round(cfg.minConf*100)}%`}><input type="range" min="0.1" max="0.95" step="0.05" value={cfg.minConf} onChange={e=>u({minConf:+e.target.value})} className="w-full accent-cyan-400"/></L></div></Card>
+  <Card t="Severity preferences"><div className="space-y-3"><L t="Medium threshold (% of image area covered)"><input type="number" step="0.1" min="0.1" className={inp} value={cfg.medT} onChange={e=>u({medT:Math.max(.1,+e.target.value)})}/></L><L t="High threshold (% of image area covered)"><input type="number" step="0.1" className={inp} value={cfg.highT} onChange={e=>u({highT:Math.max(cfg.medT+.1,+e.target.value)})}/></L>
+   <p className="text-xs text-slate-400">Potholes and alligator cracking are weighted ×1.5. Severity is estimated from image area, not measured depth, and is independent of model confidence.</p><Btn v="s" onClick={reset}>Reset dashboard data</Btn></div></Card></div>}
+
+/* ---------- App ---------- */
+const NAV:[string,string,string][]=[['overview','Overview','home'],['map','Road Map','map'],['upload','Upload & Analyze','up'],['explorer','Defect Explorer','table'],['queue','Urgent Action Queue','alert'],['orders','Work Orders','clip'],['analytics','Analytics','chart'],['settings','Settings','gear']];
+function App(){
+ const[page,setPage]=useState(()=>location.hash.slice(1)||'overview');const[open,setOpen]=useState(false);
+ const[cfg,setCfg]=useLS<Cfg>('phx_cfg',DEF);const[up,setUp]=useLS<Defect[]>('phx_up',[]);const[orders,setOrders]=useLS<Order[]>('phx_orders',[]);const[ov,setOv]=useLS<Record<string,string>>('phx_status',{});
+ useEffect(()=>{const h=()=>setPage(location.hash.slice(1)||'overview');addEventListener('hashchange',h);return()=>removeEventListener('hashchange',h)},[]);
+ const d=useMemo(()=>[...up,...seed()].map(x=>({...x,status:ov[x.id]||x.status})),[up,ov]);
+ const go=(p:string)=>{location.hash=p;setOpen(false)};
+ const setStatus=(id:string,s:string)=>setOv({...ov,[id]:s});
+ const save=(r:any)=>setUp([...r.dets.map((x:any)=>({id:`U-${r.rid.slice(4)}-${x.n}`,cls:x.cls,conf:Math.round(x.conf*100),sev:x.sev,road:'Uploaded image',imp:1,lat:r.gps?.lat??null,lng:r.gps?.lng??null,date:r.date.slice(0,10),status:'Open',reports:1,src:'upload'})),...up]);
+ const mk=(id:string)=>{setOrders([{id:'WO-'+(Date.now()%100000),defectId:id,assignee:'Unassigned',due:new Date(Date.now()+7*864e5).toISOString().slice(0,10),status:'Open',note:'Created from Urgent Action Queue'},...orders])};
+ const cur=NAV.find(n=>n[0]===page)||NAV[0];
+ return<div className="min-h-screen flex">
+  <aside className={`fixed lg:sticky top-0 z-30 h-screen w-64 bg-navy-950 border-r border-navy-600/60 p-4 flex flex-col transition-transform ${open?'':'-translate-x-full'} lg:translate-x-0`}>
+   <div className="flex items-center gap-2 mb-6"><span className="text-2xl">🔥</span><div><p className="font-bold text-cyan-400 leading-tight">Phoenix AI</p><p className="text-[10px] text-slate-400">Road Damage Detection</p></div></div>
+   <nav className="space-y-1 flex-1">{NAV.map(([id,l,ic])=><button key={id} onClick={()=>go(id)} className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition ${cur[0]===id?'bg-cyan-500/15 text-cyan-300':'text-slate-400 hover:bg-navy-700 hover:text-slate-200'}`}><Ic n={ic}/>{l}</button>)}</nav>
+   <p className="text-[10px] text-slate-500">IEEE-IGNITE Hackathon 2026<br/>Mode: <b className={cfg.mode==='demo'?'text-amber-400':'text-green-400'}>{cfg.mode==='demo'?'DEMO (no AI)':cfg.mode}</b></p></aside>
+  {open&&<div className="fixed inset-0 bg-black/50 z-20 lg:hidden" onClick={()=>setOpen(false)}/>}
+  <main className="flex-1 min-w-0"><header className="sticky top-0 z-10 bg-navy-900/80 backdrop-blur border-b border-navy-600/60 px-4 md:px-8 py-3 flex items-center gap-3"><button className="lg:hidden" onClick={()=>setOpen(true)}><Ic n="menu"/></button><h1 className="text-lg font-semibold">{cur[1]}</h1><span className="ml-auto text-xs text-slate-500 hidden sm:block">Overview data: sample · Uploads: {up.length} saved</span></header>
+   <div className="p-4 md:p-8">{page==='overview'&&<Overview d={d} orders={orders}/>}{page==='map'&&<MapPage d={d}/>}{page==='upload'&&<Upload cfg={cfg} onSave={save}/>}{page==='explorer'&&<Explorer d={d}/>}{page==='queue'&&<Queue d={d} orders={orders} mk={mk}/>}{page==='orders'&&<Orders d={d} orders={orders} setOrders={setOrders} setStatus={setStatus}/>}{page==='analytics'&&<Analytics d={d}/>}{page==='settings'&&<Settings cfg={cfg} setCfg={setCfg} reset={()=>{setUp([]);setOrders([]);setOv({})}}/>}</div></main></div>}
+ReactDOM.createRoot(document.getElementById('root')!).render(<App/>);
+</script>
+<script>
+try{
+ var src=document.getElementById('app').textContent;
+ var out=Babel.transform(src,{filename:'app.tsx',presets:[['typescript',{isTSX:true,allExtensions:true}],'react']}).code;
+ var s=document.createElement('script');s.textContent=out;document.body.appendChild(s);
+}catch(e){document.getElementById('root').innerHTML='<pre style="padding:2rem;color:#f87171">Failed to start: '+e.message+'</pre>'}
+</script>
+</body>
+</html>
